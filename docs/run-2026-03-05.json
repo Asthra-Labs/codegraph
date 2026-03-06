@@ -1,0 +1,58 @@
+{
+  "repoPath": "/home/gpu/workspace/juspay/xyne-cli",
+  "indexedAt": "2026-03-04T20:36:47.651Z",
+  "files": {
+    "total": 669,
+    "typescript": 356,
+    "javascript": 308,
+    "skipped": 5
+  },
+  "nodes": {
+    "total": 3858,
+    "byLabel": {
+      "class": 230,
+      "method": 1829,
+      "function": 1206,
+      "interface": 436,
+      "type_alias": 154,
+      "enum": 3
+    },
+    "exported": 1000,
+    "entryPoints": 0,
+    "deadCode": 0
+  },
+  "edges": {
+    "total": 29699,
+    "byType": {
+      "calls": 28172,
+      "instantiates": 683,
+      "uses_type": 781,
+      "extends": 58,
+      "implements": 5
+    },
+    "callsStats": {
+      "total": 29749,
+      "resolved": 8349,
+      "unresolved": 21400,
+      "unresolvedPercent": 71.93519109886046
+    },
+    "confidenceDistribution": {
+      "0.5-0.79": 29578,
+      "0.8-0.99": 1301,
+      "1.0": 67
+    }
+  },
+  "coverage": {
+    "nodesWithInboundCalls": 27.216174183514774,
+    "nodesWithOutboundCalls": 564.3338517366511,
+    "avgInboundCalls": 7.556190476190476,
+    "avgOutboundCalls": 1.3253261069263274,
+    "callDensity": 7.479263867288751,
+    "relationshipDensity": 7.698030067392431
+  },
+  "performance": {
+    "indexTimeMs": 1674,
+    "filesPerSecond": 399.6415770609319,
+    "symbolsPerSecond": 2304.6594982078855
+  }
+}
