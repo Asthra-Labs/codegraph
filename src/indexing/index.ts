@@ -1,0 +1,16 @@
+export {
+  computeFileHash,
+  computeContentHash,
+  getIndexedFiles,
+  detectFileChanges,
+  applyTombstone,
+  updateFileHash,
+  applyRepoContext,
+  incrementalIndex,
+  buildFilterClause,
+  type IndexingContext,
+  type FileChange,
+  type IndexingResult,
+  type SearchFilters,
+  DEFAULT_CONTEXT,
+} from './incremental.js';
