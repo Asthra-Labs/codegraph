@@ -69,6 +69,7 @@ import {
   getDefaultDbPath,
 } from "./store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import { loadGitignoreRules, shouldIgnore, getDefaultExclusions } from "./gitignore.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -1388,7 +1389,6 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
 
   // Clear Ollama cache on index
   clearCache(db);
@@ -1400,18 +1400,32 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   console.log(`Collection: ${resolvedPwd} (${globPattern})`);
 
+  // Load gitignore rules from the target directory
+  const gitignoreRules = loadGitignoreRules(resolvedPwd);
+  const defaultExclusions = getDefaultExclusions();
+
   progress.indeterminate();
   const allFiles: string[] = await fastGlob(globPattern, {
     cwd: resolvedPwd,
     onlyFiles: true,
     followSymbolicLinks: false,
     dot: false,
-    ignore: excludeDirs.map(d => `**/${d}/**`),
+    ignore: defaultExclusions,
   });
-  // Filter hidden files/folders (dot: false handles top-level but not nested)
+  
+  // Filter files based on gitignore rules and hidden files
   const files = allFiles.filter(file => {
     const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
+    // Skip hidden files/folders
+    if (parts.some(part => part.startsWith("."))) {
+      return false;
+    }
+    // Skip files matching gitignore patterns
+    const fullPath = resolve(resolvedPwd, file);
+    if (shouldIgnore(fullPath, gitignoreRules, resolvedPwd)) {
+      return false;
+    }
+    return true;
   });
 
   const total = files.length;
