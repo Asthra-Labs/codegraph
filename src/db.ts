@@ -36,6 +36,8 @@ export interface Database {
   prepare(sql: string): Statement;
   loadExtension(path: string): void;
   close(): void;
+  pragma(pragma: string): any;
+  transaction(fn: (...args: any[]) => any): (...args: any[]) => any;
 }
 
 export interface Statement {

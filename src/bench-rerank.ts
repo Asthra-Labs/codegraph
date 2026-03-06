@@ -88,7 +88,6 @@ function median(arr: number[]): number {
 interface BenchResult {
   parallelism: number;
   contextSize: number;
-  flashAttention: boolean;
   times: number[];       // ms per run
   medianMs: number;
   docsPerSec: number;
@@ -102,7 +101,6 @@ async function benchmarkConfig(
   llama: Llama,
   docs: string[],
   parallelism: number,
-  flash: boolean,
 ): Promise<BenchResult> {
   // Measure VRAM before
   const vramBefore = llama.gpu ? await llama.getVramState() : null;
@@ -115,12 +113,11 @@ async function benchmarkConfig(
     try {
       contexts.push(await model.createRankingContext({
         contextSize: CONTEXT_SIZE,
-        flashAttention: flash,
         ...(cpuThreads > 0 ? { threads: cpuThreads } : {}),
       }));
     } catch {
       if (contexts.length === 0) {
-        // Try without flash
+        // Try with minimal options
         contexts.push(await model.createRankingContext({
           contextSize: CONTEXT_SIZE,
           ...(cpuThreads > 0 ? { threads: cpuThreads } : {}),
@@ -173,7 +170,6 @@ async function benchmarkConfig(
   return {
     parallelism: actualParallelism,
     contextSize: CONTEXT_SIZE,
-    flashAttention: flash,
     times,
     medianMs: med,
     docsPerSec: (docs.length / med) * 1000,
@@ -193,7 +189,7 @@ async function main() {
   console.log("═══════════════════════════════════════════════════════════════\n");
 
   // Detect GPU
-  const gpuTypes = await getLlamaGpuTypes();
+  const gpuTypes = await getLlamaGpuTypes("supported");
   const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
 
   let llama: Llama;
@@ -265,23 +261,13 @@ async function main() {
       }
     }
 
-    // Test with flash attention
-    process.stdout.write(`\n  [${p} ctx, flash] running...`);
+    process.stdout.write(`\n  [${p} ctx] running...`);
     try {
-      const r = await benchmarkConfig(model, llama, docs, p, true);
+      const r = await benchmarkConfig(model, llama, docs, p);
       results.push(r);
       process.stdout.write(` ${r.medianMs.toFixed(0)}ms (${r.docsPerSec.toFixed(1)} docs/s)\n`);
     } catch (e: any) {
       process.stdout.write(` failed: ${e.message}\n`);
-      // Try without flash
-      process.stdout.write(`  [${p} ctx, no flash] running...`);
-      try {
-        const r = await benchmarkConfig(model, llama, docs, p, false);
-        results.push(r);
-        process.stdout.write(` ${r.medianMs.toFixed(0)}ms (${r.docsPerSec.toFixed(1)} docs/s)\n`);
-      } catch (e2: any) {
-        process.stdout.write(` failed: ${e2.message}\n`);
-      }
     }
   }
 
@@ -290,8 +276,8 @@ async function main() {
   console.log("  Results");
   console.log("═══════════════════════════════════════════════════════════════\n");
 
-  const header = "  Ctx  Flash  Median    Docs/s   VRAM/ctx   Total VRAM  Peak RSS";
-  const sep    = "  ───  ─────  ──────    ──────   ────────   ──────────  ────────";
+  const header = "  Ctx    Median    Docs/s   VRAM/ctx   Total VRAM  Peak RSS";
+  const sep    = "  ───    ──────    ──────   ────────   ──────────  ────────";
   console.log(header);
   console.log(sep);
 
@@ -300,8 +286,7 @@ async function main() {
     const speedup = baseline / r.medianMs;
     const speedupStr = r === results[0] ? "      " : `(${speedup.toFixed(1)}×)`;
     console.log(
-      `  ${String(r.parallelism).padStart(3)}  ` +
-      `${r.flashAttention ? " yes " : "  no "}  ` +
+      `  ${String(r.parallelism).padStart(3)}      ` +
       `${r.medianMs.toFixed(0).padStart(5)}ms  ` +
       `${r.docsPerSec.toFixed(1).padStart(6)}  ` +
       `${formatBytes(r.vramPerContext).padStart(8)}  ` +
@@ -314,7 +299,7 @@ async function main() {
   // Best config
   if (results.length > 0) {
     const best = results.reduce((a, b) => a.docsPerSec > b.docsPerSec ? a : b);
-    console.log(`\n  Best: ${best.parallelism} contexts, flash=${best.flashAttention}`);
+    console.log(`\n  Best: ${best.parallelism} contexts`);
     console.log(`        ${best.medianMs.toFixed(0)}ms for ${DOC_COUNT} docs (${best.docsPerSec.toFixed(1)} docs/s)`);
     if (best.totalVram > 0) console.log(`        ${formatBytes(best.totalVram)} VRAM`);
   }

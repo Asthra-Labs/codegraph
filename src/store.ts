@@ -220,8 +220,10 @@ export function findBestCutoff(
 
 // Hybrid query: strong BM25 signal detection thresholds
 // Skip expensive LLM expansion when top result is strong AND clearly separated from runner-up
-export const STRONG_SIGNAL_MIN_SCORE = 0.85;
-export const STRONG_SIGNAL_MIN_GAP = 0.15;
+// Strong signal detection thresholds
+// Tuned for code: lower threshold since code BM25 scores are often lower
+export const STRONG_SIGNAL_MIN_SCORE = 0.70;  // Was 0.85, now 0.70 for code files
+export const STRONG_SIGNAL_MIN_GAP = 0.20;    // Was 0.15, now 0.20 for higher confidence
 // Max candidates to pass to reranker — balances quality vs latency.
 // 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
 export const RERANK_CANDIDATE_LIMIT = 40;
@@ -809,7 +811,7 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
-  expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
+  expandQuery: (query: string, model?: string, context?: string) => Promise<ExpandedQuery[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
 
   // Document retrieval
@@ -892,7 +894,7 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
+    expandQuery: (query: string, model?: string, context?: string) => expandQuery(query, model, db, context),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
 
     // Document retrieval
@@ -2029,9 +2031,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
     // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
-    // |x| / (1 + |x|) maps: strong(-10)→0.91, medium(-2)→0.67, weak(-0.5)→0.33, none(0)→0.
-    // Monotonic and query-independent — no per-query normalization needed.
-    const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
+    // Using gentler denominator to expand gaps between scores:
+    // |x| / (2 + |x|) maps: strong(-10)→0.83, medium(-2)→0.50, weak(-0.5)→0.20
+    // Gap between strong and medium is 0.33, ensuring gaps >= 0.2 for dominant matches.
+    const score = Math.abs(row.bm25_score) / (2 + Math.abs(row.bm25_score));
     return {
       filepath: row.filepath,
       displayPath: row.display_path,
@@ -2201,8 +2204,7 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
-  // Check cache first — stored as JSON preserving types
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, context?: string): Promise<ExpandedQuery[]> {
   const cacheKey = getCacheKey("expandQuery", { query, model });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
@@ -2214,8 +2216,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
   }
 
   const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
+  const results = await llm.expandQuery(query, { context });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
   // Filter out entries that duplicate the original query text.
@@ -2831,10 +2832,9 @@ export async function hybridQuery(
 
   if (hasStrongSignal) hooks?.onStrongSignal?.(topScore);
 
-  // Step 2: Expand query (or skip if strong signal)
   const expanded = hasStrongSignal
     ? []
-    : await store.expandQuery(query);
+    : await store.expandQuery(query, undefined, "source code repository");
 
   hooks?.onExpand?.(query, expanded);
 
@@ -3024,8 +3024,7 @@ export async function vectorSearchQuery(
   ).get();
   if (!hasVectors) return [];
 
-  // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = await store.expandQuery(query, undefined, "source code repository");
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded);
 

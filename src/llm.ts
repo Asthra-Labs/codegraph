@@ -951,7 +951,23 @@ export class LlamaCpp implements LLM {
       `
     });
 
-    const prompt = `/no_think Expand this search query: ${query}`;
+    // Code-aware query expansion prompt
+    // Teaches the model to generate symbol-aware expansions for source code search
+    const contextSection = context
+      ? `\nRepository context: ${context}\n`
+      : '';
+    const prompt = `/no_think You are a code search query expander. Given a search query about source code, generate expanded queries to find relevant code.
+${contextSection}
+Rules:
+- lex: exact identifiers, function/class/module names, error strings (grep-style)
+- vec: semantic descriptions of the code concept
+- hyde: hypothetical code snippets that would match (write plausible source code)
+
+For identifier queries (e.g. "UserService", "handleAuth"), prioritize lex with exact names, snake_case/camelCase variants, and likely method names.
+For conceptual queries (e.g. "how authentication works"), prioritize vec with descriptions and hyde with plausible implementations.
+For error queries (e.g. "TypeError: cannot read property"), prioritize lex with the exact error string and related handler names.
+
+Query: ${query}`;
 
     // Create fresh context for each call
     const genContext = await this.generateModel!.createContext();
