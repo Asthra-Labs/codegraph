@@ -101,6 +101,10 @@ const SKIP_DIRS = new Set([
   '.idea', '.vscode', '.vs',
   // Test/coverage
   'coverage', '.nyc_output', '.coverage', 'htmlcov',
+  '__tests__', 'test', 'tests', 'testing',
+  '__mocks__', '__fixtures__', 'fixtures',
+  'benchmark', 'benchmarks', 'perf', 'performance',
+  'example', 'examples', 'demo', 'demos',
   // Temp/cache
   'temp', 'temp-build', 'tmp', '.cache', '.temp',
   // Misc
@@ -213,13 +217,6 @@ export class IngestionPipeline {
       this.reportProgress('persisting', 0, 'Persisting to storage...');
       await this.storage.bulkLoad(this.graph);
       this.reportProgress('persisting', 1, 'Persisted to storage');
-    }
-
-    // Phase 9: Persist to storage
-    if (this.storage) {
-      this.reportProgress('persisting', 0, 'Persisting to storage...');
-      await this.storage.bulkLoad(this.graph);
-      this.reportProgress('persisting', 1);
     }
 
     // Build result
@@ -383,70 +380,99 @@ export class IngestionPipeline {
 
   /**
    * Phase 3: Parse files and extract symbols
+   * Uses concurrent parsing with a concurrency limit for speedup,
+   * then processes graph updates serially (graph is not thread-safe).
    */
   private async parseFiles(files: string[]): Promise<Map<string, ParseResult>> {
     const results = new Map<string, ParseResult>();
+    const CONCURRENCY = 8;
+
+    // Step 1: Parallel parse — stateless, safe to parallelize
+    type ParsedFile = { file: string; parseResult: ParseResult };
+    const parsed: ParsedFile[] = [];
+    const parseErrors: Array<{ file: string; error: string }> = [];
     let processed = 0;
 
-    for (const file of files) {
-      try {
-        const parser = getParserForFile(file);
-        if (!parser) {
-          // Skip files without parsers
-          continue;
-        }
+    // Process in concurrent batches
+    for (let i = 0; i < files.length; i += CONCURRENCY) {
+      const batch = files.slice(i, i + CONCURRENCY);
 
-        const content = fs.readFileSync(file, 'utf-8');
-        const parseResult = await parser.parse(content, file);
-        results.set(file, parseResult);
+      const batchResults = await Promise.allSettled(
+        batch.map(async (file): Promise<ParsedFile | null> => {
+          const parser = getParserForFile(file);
+          if (!parser) return null;
 
-        // Create symbol nodes
-        for (const symbol of parseResult.symbols) {
-          const node = new GraphNode({
-            label: this.symbolKindToLabel(symbol.kind),
-            name: symbol.name,
-            filePath: file,
-            startLine: symbol.startLine,
-            endLine: symbol.endLine,
-            content: symbol.content ?? null,
-            signature: symbol.signature ?? null,
-            language: parseResult.language,
-            className: symbol.className ?? null,
-            isExported: symbol.isExported ?? false,
+          const content = fs.readFileSync(file, 'utf-8');
+          const parseResult = await parser.parse(content, file);
+          return { file, parseResult };
+        })
+      );
+
+      for (let j = 0; j < batchResults.length; j++) {
+        const result = batchResults[j]!;
+        if (result.status === 'fulfilled' && result.value) {
+          parsed.push(result.value);
+        } else if (result.status === 'rejected') {
+          const file = batch[j]!;
+          parseErrors.push({
+            file,
+            error: result.reason instanceof Error ? result.reason.message : String(result.reason),
           });
-          this.graph.addNode(node);
-
-          // Create DEFINES relationship from file
-          const fileId = generateNodeId(NodeLabel.FILE, file, path.basename(file));
-          const rel = new GraphRelationship({
-            type: RelType.DEFINES,
-            source: fileId,
-            target: node.id,
-          });
-          this.graph.addRelationship(rel);
-
-          // Create MEMBER_OF relationship for methods
-          if (symbol.className && symbol.kind === 'method') {
-            const classId = generateNodeId(NodeLabel.CLASS, file, symbol.className);
-            const memberRel = new GraphRelationship({
-              type: RelType.MEMBER_OF,
-              source: node.id,
-              target: classId,
-            });
-            this.graph.addRelationship(memberRel);
-          }
         }
-
-        processed++;
-        if (processed % 50 === 0) {
-          this.reportProgress('parsing', processed / files.length, `Parsed ${processed}/${files.length} files`);
-        }
-      } catch (error) {
-        this.errors.push({
-          file,
-          error: error instanceof Error ? error.message : String(error),
-        });
       }
+
+      processed += batch.length;
+      if (processed % 50 < CONCURRENCY || processed === files.length) {
+        this.reportProgress('parsing', processed / files.length, `Parsed ${processed}/${files.length} files`);
+      }
+    }
+
+    // Collect parse errors
+    this.errors.push(...parseErrors);
+
+    // Step 2: Serial graph updates — graph is not thread-safe
+    for (const { file, parseResult } of parsed) {
+      results.set(file, parseResult);
+
+      for (const symbol of parseResult.symbols) {
+        const node = new GraphNode({
+          label: this.symbolKindToLabel(symbol.kind),
+          name: symbol.name,
+          filePath: file,
+          startLine: symbol.startLine,
+          endLine: symbol.endLine,
+          content: symbol.content ?? null,
+          signature: symbol.signature ?? null,
+          language: parseResult.language,
+          className: symbol.className ?? null,
+          isExported: symbol.isExported ?? false,
+        });
+        this.graph.addNode(node);
+
+        // Create DEFINES relationship from file
+        const fileId = generateNodeId(NodeLabel.FILE, file, path.basename(file));
+        const rel = new GraphRelationship({
+          type: RelType.DEFINES,
+          source: fileId,
+          target: node.id,
+        });
+        this.graph.addRelationship(rel);
+
+        // Create MEMBER_OF relationship for methods
+        if (symbol.className && symbol.kind === 'method') {
+          const classId = generateNodeId(NodeLabel.CLASS, file, symbol.className);
+          const memberRel = new GraphRelationship({
+            type: RelType.MEMBER_OF,
+            source: node.id,
+            target: classId,
+          });
+          this.graph.addRelationship(memberRel);
+        }
+      }
+    }
+
+    if (parseErrors.length > 0) {
+      console.log(`   ⚠️ ${parseErrors.length} files had parse errors`);
     }
 
     return results;
@@ -808,10 +834,7 @@ export class IngestionPipeline {
       }
     }
 
-    this.stats.relationshipsCreated += result.communities.reduce(
-      (sum, c) => sum + c.memberIds.length,
-      0
-    );
+    // Stats are computed from graph.stats() at the end of run()
   }
 
   private detectProcesses(): void {
@@ -850,10 +873,7 @@ export class IngestionPipeline {
       }
     }
 
-    this.stats.relationshipsCreated += result.processes.reduce(
-      (sum, p) => sum + p.steps.length,
-      0
-    );
+    // Stats are computed from graph.stats() at the end of run()
   }
 
   private detectChangeCoupling(): void {
@@ -880,7 +900,7 @@ export class IngestionPipeline {
       this.graph.addRelationship(coupleRel);
     }
 
-    this.stats.relationshipsCreated += topCouplings.length;
+    // Stats are computed from graph.stats() at the end of run()
   }
 
   // ==================== Helpers ====================
