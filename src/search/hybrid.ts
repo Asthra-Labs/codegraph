@@ -6,6 +6,14 @@
  */
 
 import type { StorageBackend, SearchResult } from '../graph/storage-backend.js';
+import { normalizeResults, normalizedToSearchResults } from './result-normalizer.js';
+import type { NormalizedSearchResult } from './normalized-result.js';
+import { TelemetryCollector } from './search-telemetry.js';
+import type { SearchTelemetry, RerankMethod } from './search-telemetry.js';
+import { rerankResults, blendScoresBatch } from './shared-reranker.js';
+import type { RerankOptions } from './shared-reranker.js';
+import { selectRerankMethod, DEFAULT_RERANK_POLICY } from './query-type-detector.js';
+import type { RerankPolicy } from './query-type-detector.js';
 
 /**
  * Reciprocal Rank Fusion (RRF) algorithm
@@ -51,9 +59,9 @@ export function reciprocalRankFusion(
 
   const sortedResults = Array.from(scores.values())
     .sort((a, b) => b.rrfScore - a.rrfScore)
-    .map(({ result, bestRelevanceScore }) => ({
+    .map(({ result, rrfScore }) => ({
       ...result,
-      score: bestRelevanceScore,
+      score: rrfScore,
     }));
 
   return sortedResults;
@@ -63,20 +71,28 @@ export function reciprocalRankFusion(
  * Hybrid Search Options
  */
 export interface HybridSearchOptions {
-  /** Maximum number of results to return */
   limit?: number;
-  /** Weight for FTS results */
   ftsWeight?: number;
-  /** Weight for vector results */
   vectorWeight?: number;
-  /** RRF smoothing constant */
   rrfK?: number;
-  /** Whether to use fuzzy search as fallback */
   useFuzzyFallback?: boolean;
-  /** Whether to include call graph context */
   includeCallGraph?: boolean;
-  /** Call graph traversal depth */
   callGraphDepth?: number;
+  normalize?: boolean;
+  collectTelemetry?: boolean;
+  rerank?: boolean;
+  rerankMethod?: 'heuristic' | 'model' | 'auto';
+  heuristicRerankTopK?: number;
+  modelRerankTopK?: number;
+  rerankFallbackToHeuristic?: boolean;
+  rrfScoreWeight?: number;
+  rerankScoreWeight?: number;
+  rerankPolicy?: RerankPolicy;
+}
+
+export interface HybridSearchResult {
+  results: SearchResult[];
+  telemetry: SearchTelemetry;
 }
 
 /**
@@ -87,7 +103,7 @@ export async function hybridSearch(
   storage: StorageBackend,
   queryEmbedding: number[] | null = null,
   options: HybridSearchOptions = {}
-): Promise<SearchResult[]> {
+): Promise<HybridSearchResult> {
   const {
     limit = 20,
     ftsWeight = 1.0,
@@ -96,63 +112,158 @@ export async function hybridSearch(
     useFuzzyFallback = true,
     includeCallGraph = false,
     callGraphDepth = 1,
+    normalize = true,
+    collectTelemetry = true,
+    rerank = true,
+    rerankMethod = 'heuristic',
+    heuristicRerankTopK = 50,
+    modelRerankTopK = 20,
+    rerankFallbackToHeuristic = true,
+    rrfScoreWeight = 0.7,
+    rerankScoreWeight = 0.3,
+    rerankPolicy = DEFAULT_RERANK_POLICY,
   } = options;
 
+  const telemetry = new TelemetryCollector();
   const rankedLists: Array<{ results: SearchResult[]; weight: number }> = [];
 
-  // Run FTS search
-  let ftsResults = await storage.ftsSearch(query, limit * 2);
-  
-  // Fallback to fuzzy search if FTS returns no results
-  if (ftsResults.length === 0 && useFuzzyFallback) {
-    ftsResults = await storage.fuzzySearch(query, limit * 2);
-  }
-  
-  if (ftsResults.length > 0) {
-    rankedLists.push({ results: ftsResults, weight: ftsWeight });
-  }
-
-  // Run vector search if embedding is provided
-  if (queryEmbedding && vectorWeight > 0) {
-    const vectorResults = await storage.vectorSearch(queryEmbedding, limit * 2);
-    if (vectorResults.length > 0) {
-      rankedLists.push({ results: vectorResults, weight: vectorWeight });
-    }
-  }
-
-  // If no results from any method, return empty
-  if (rankedLists.length === 0) {
-    return [];
-  }
-
-  // Fuse results using RRF
-  let fusedResults = reciprocalRankFusion(rankedLists, rrfK);
-
-  // Expand with call graph context if requested
-  if (includeCallGraph && fusedResults.length > 0) {
-    const expandedResults = await expandWithCallGraph(
-      fusedResults.slice(0, Math.ceil(limit / 2)),
-      storage,
-      callGraphDepth
-    );
-    
-    // Merge and re-rank
-    const allResults = new Map<string, SearchResult>();
-    for (const result of fusedResults) {
-      allResults.set(result.nodeId, result);
-    }
-    for (const result of expandedResults) {
-      if (!allResults.has(result.nodeId)) {
-        allResults.set(result.nodeId, { ...result, score: result.score * 0.5 }); // Demote call graph results
+  try {
+    await telemetry.timeAsync('graph_fts_ms', async () => {
+      let ftsResults = await storage.ftsSearch(query, limit * 2);
+      
+      if (ftsResults.length === 0 && useFuzzyFallback) {
+        ftsResults = await storage.fuzzySearch(query, limit * 2);
       }
-    }
-    
-    fusedResults = Array.from(allResults.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
-  }
+      
+      if (ftsResults.length > 0) {
+        rankedLists.push({ results: ftsResults, weight: ftsWeight });
+        telemetry.setCount('graph_hits', ftsResults.length);
+      }
+    });
 
-  return fusedResults.slice(0, limit);
+    if (queryEmbedding && vectorWeight > 0) {
+      await telemetry.timeAsync('graph_vec_ms', async () => {
+        const vectorResults = await storage.vectorSearch(queryEmbedding, limit * 2);
+        if (vectorResults.length > 0) {
+          rankedLists.push({ results: vectorResults, weight: vectorWeight });
+        }
+      });
+    }
+
+    if (rankedLists.length === 0) {
+      return {
+        results: [],
+        telemetry: telemetry.build(query),
+      };
+    }
+
+    let fusedResults: SearchResult[];
+    telemetry.time('rrf_ms', () => {
+      fusedResults = reciprocalRankFusion(rankedLists, rrfK);
+      telemetry.setCount('fused_hits', fusedResults.length);
+    });
+    fusedResults = fusedResults!;
+
+    let normalizedResults: NormalizedSearchResult[] = [];
+    
+    if (normalize && fusedResults.length > 0) {
+      telemetry.time('normalize_ms', () => {
+        normalizedResults = normalizeResults(fusedResults);
+        telemetry.setCount('fused_hits', normalizedResults.length);
+      });
+    }
+
+    // Rerank results
+    if (rerank && normalizedResults.length > 0) {
+      let effectiveMethod: 'model' | 'heuristic' | 'none' = rerankMethod === 'auto' ? 'heuristic' : rerankMethod;
+      
+      if (rerankMethod === 'auto') {
+        const selection = selectRerankMethod(query, 'auto', rerankPolicy);
+        effectiveMethod = selection.selectedMethod;
+        
+        telemetry.setQueryDetection({
+          queryType: selection.queryType,
+          confidence: selection.confidence,
+          reason: selection.reason,
+          selectedMethod: selection.selectedMethod,
+        });
+      }
+      
+      const rerankTopK = effectiveMethod === 'model' ? modelRerankTopK : heuristicRerankTopK;
+      
+      const rerankStart = Date.now();
+      const rerankResult = await rerankResults(normalizedResults, query, {
+        method: effectiveMethod,
+        topK: rerankTopK,
+        fallbackToHeuristic: rerankFallbackToHeuristic,
+      });
+      
+      telemetry.setReranking({
+        rerank_method: rerankResult.method,
+        rerank_fallback_reason: rerankResult.fallbackReason,
+        rerank_input_count: Math.min(normalizedResults.length, rerankTopK),
+        rerank_output_count: rerankResult.results.length,
+        model_used: rerankResult.modelUsed,
+        rerank_model_load_ms: rerankResult.modelLoadMs,
+        rerank_inference_ms: rerankResult.inferenceMs,
+      });
+      
+      // Apply blended scoring with proper calibration
+      // For model reranker: converts scores to percentile ranks before blending
+      // For heuristic reranker: uses scores as-is
+      normalizedResults = blendScoresBatch(rerankResult.results, {
+        rrfWeight: rrfScoreWeight,
+        rerankWeight: rerankScoreWeight,
+        rerankMethod: rerankResult.method,
+      });
+      
+      // Sort by final score
+      normalizedResults.sort((a, b) => (b.finalScore ?? 0) - (a.finalScore ?? 0));
+      
+      telemetry.setCount('reranked_hits', normalizedResults.length);
+    }
+
+    // Convert back to SearchResult format
+    fusedResults = normalizedResults.length > 0 
+      ? normalizedToSearchResults(normalizedResults)
+      : fusedResults;
+
+    if (includeCallGraph && fusedResults.length > 0) {
+      const expandedResults = await expandWithCallGraph(
+        fusedResults.slice(0, Math.ceil(limit / 2)),
+        storage,
+        callGraphDepth
+      );
+      
+      const allResults = new Map<string, SearchResult>();
+      for (const result of fusedResults) {
+        allResults.set(result.nodeId, result);
+      }
+      for (const result of expandedResults) {
+        if (!allResults.has(result.nodeId)) {
+          allResults.set(result.nodeId, { ...result, score: result.score * 0.5 });
+        }
+      }
+      
+      fusedResults = Array.from(allResults.values())
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+    }
+
+    const finalResults = fusedResults.slice(0, limit);
+    telemetry.setCount('final_hits', finalResults.length);
+
+    return {
+      results: finalResults,
+      telemetry: telemetry.build(query),
+    };
+  } catch (error) {
+    telemetry.markFailed(String(error));
+    return {
+      results: [],
+      telemetry: telemetry.build(query),
+    };
+  }
 }
 
 /**
@@ -225,14 +336,33 @@ export async function codeAwareSearch(
   storage: StorageBackend,
   embedFn: (text: string) => Promise<number[]>,
   options: HybridSearchOptions = {}
-): Promise<SearchResult[]> {
-  // Generate embedding for the query
+): Promise<HybridSearchResult> {
+  const telemetry = new TelemetryCollector();
   let queryEmbedding: number[] | null = null;
-  try {
-    queryEmbedding = await embedFn(query);
-  } catch {
-    // Continue without embedding if it fails
-  }
 
-  return hybridSearch(query, storage, queryEmbedding, options);
+  try {
+    await telemetry.timeAsync('embed_ms', async () => {
+      try {
+        queryEmbedding = await embedFn(query);
+      } catch {
+        // Continue without embedding if it fails
+      }
+    });
+
+    const result = await hybridSearch(query, storage, queryEmbedding, options);
+    
+    return {
+      results: result.results,
+      telemetry: {
+        ...result.telemetry,
+        embed_ms: telemetry.build().embed_ms,
+      },
+    };
+  } catch (error) {
+    telemetry.markFailed(String(error));
+    return {
+      results: [],
+      telemetry: telemetry.build(query),
+    };
+  }
 }
