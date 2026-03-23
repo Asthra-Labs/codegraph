@@ -277,8 +277,8 @@ describe('P5: Quality Evaluation', () => {
         });
 
         // With rerank
-        const reranked = rerankResults(mappedResults, q.query, DEFAULT_RERANKER_OPTIONS);
-        const retrievedRerank = reranked.map(r => r.id);
+        const reranked = await rerankResults(mappedResults, q.query, DEFAULT_RERANKER_OPTIONS);
+        const retrievedRerank = reranked.results.map(r => r.id);
         allResults.push({
           queryId: q.id,
           category: q.category,
@@ -340,7 +340,7 @@ describe('P5: Quality Evaluation', () => {
       console.log('========================================\n');
       
       expect(allResults.length).toBeGreaterThan(0);
-    });
+    }, 20000);
   });
 });
 
