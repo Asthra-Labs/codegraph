@@ -521,6 +521,7 @@ export class SQLiteBackend implements StorageBackend {
     const db = this.getDb();
 
     const terms = query.split(/\s+/).filter(t => t.length > 0);
+    const candidateLimit = Math.max(limit * 5, 50);
     
     const filterConditions: string[] = [];
     const filterParams: any[] = [];
@@ -558,7 +559,7 @@ export class SQLiteBackend implements StorageBackend {
       WHERE 1=1 ${filterClause}
       ORDER BY bm25_score
       LIMIT ?
-    `).all(andQuery, ...filterParams, limit) as (GraphNodeRow & { bm25_score: number })[];
+    `).all(andQuery, ...filterParams, candidateLimit) as (GraphNodeRow & { bm25_score: number })[];
 
     // Fallback to OR logic if AND returns no results (better recall)
     if (rows.length === 0 && terms.length > 1) {
@@ -573,26 +574,93 @@ export class SQLiteBackend implements StorageBackend {
         WHERE 1=1 ${filterClause}
         ORDER BY bm25_score
         LIMIT ?
-      `).all(orQuery, ...filterParams, limit) as (GraphNodeRow & { bm25_score: number })[];
+      `).all(orQuery, ...filterParams, candidateLimit) as (GraphNodeRow & { bm25_score: number })[];
     }
 
-    return rows.map(row => {
+    // Normalize BM25 scores using min-max within this batch
+    // BM25 scores are negative; more negative = more relevant
+    const rawScores = rows.map(r => r.bm25_score);
+    const minScore = Math.min(...rawScores); // most relevant (most negative)
+    const maxScore = Math.max(...rawScores); // least relevant (least negative)
+    const scoreRange = maxScore - minScore;
+
+    const normalizedTerms = terms
+      .map(t => t.toLowerCase())
+      .filter(t => t.length >= 2);
+    const phrase = query.trim().toLowerCase();
+
+    const scoredResults = rows.map(row => {
       const rawScore = row.bm25_score;
-      const score = rawScore < 0
-        ? Math.abs(rawScore) / (1 + Math.abs(rawScore))
-        : 0.1;
+      // Linear min-max normalization to [0.1, 1.0]
+      // Most relevant (most negative bm25) -> 1.0, least relevant -> 0.1
+      let score: number;
+      if (scoreRange === 0) {
+        score = 0.5; // all same score
+      } else {
+        score = 0.1 + 0.9 * ((maxScore - rawScore) / scoreRange);
+      }
 
       let adjustedScore = score;
+
+      const searchText = [
+        row.name || '',
+        row.signature || '',
+        row.file_path || '',
+        row.content || '',
+      ].join(' ').toLowerCase();
+      const nameText = (row.name || '').toLowerCase();
+
+      let matchedTerms = 0;
+      for (const term of normalizedTerms) {
+        if (searchText.includes(term)) {
+          matchedTerms++;
+        }
+      }
+      const termCoverage = normalizedTerms.length > 0 ? matchedTerms / normalizedTerms.length : 0;
+      const nameMatchedTerms = normalizedTerms.filter(t => nameText.includes(t)).length;
+      const nameCoverage = normalizedTerms.length > 0 ? nameMatchedTerms / normalizedTerms.length : 0;
+
+      // Multi-term relevance: prefer hits covering more query terms.
+      if (normalizedTerms.length > 0) {
+        adjustedScore *= 0.7 + (0.6 * termCoverage); // [0.7, 1.3]
+      }
+
+      // Prefer symbols whose own name/signature matches the query intent.
+      if (normalizedTerms.length > 1) {
+        if (nameCoverage === 0) {
+          adjustedScore *= 0.55;
+        } else if (nameCoverage < 1) {
+          adjustedScore *= 0.65;
+        } else {
+          adjustedScore *= 1.8;
+        }
+      }
+
+      // Exact phrase should beat weak partial matches for intent queries.
+      if (phrase.length >= 4 && searchText.includes(phrase)) {
+        adjustedScore *= 1.15;
+      }
+
+      // Small boost when filename/path includes multiple query terms.
+      const pathText = (row.file_path || '').toLowerCase();
+      const pathMatches = normalizedTerms.filter(t => pathText.includes(t)).length;
+      if (pathMatches >= 2) {
+        adjustedScore *= 1.1;
+      }
+
       if (row.file_path?.includes('test') || row.file_path?.includes('spec')) {
         adjustedScore *= 0.5;
       }
-      if (row.label === NodeLabel.FUNCTION || row.label === NodeLabel.CLASS) {
+      if ((row.label === NodeLabel.FUNCTION || row.label === NodeLabel.CLASS) && (termCoverage >= 0.5 || nameCoverage > 0)) {
         adjustedScore *= 1.2;
       }
       adjustedScore = Math.min(1.0, adjustedScore);
 
       return this.rowToSearchResult(row, adjustedScore);
     });
+
+    scoredResults.sort((a, b) => b.score - a.score);
+    return scoredResults.slice(0, limit);
   }
 
   async fuzzySearch(query: string, limit: number = 20): Promise<SearchResult[]> {

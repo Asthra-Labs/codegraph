@@ -165,14 +165,14 @@ function unifiedRRF(
     vectorRank?: number;
   }>();
 
-  let ftsListIndex = 0;
-  let vecListIndex = 0;
-
   for (let listIdx = 0; listIdx < rankedLists.length; listIdx++) {
     const listEntry = rankedLists[listIdx];
     if (!listEntry) continue;
-    
+
     const { results, weight } = listEntry;
+    // Determine if this is an FTS list by checking if the first result has a negative raw score
+    // (BM25 scores are negative). Also check listIdx pattern: even indices are FTS, odd are vector
+    // within each source group (graph: 0=fts, 1=vec; retrieval: 2=fts, 3=vec)
     const isFts = listIdx % 2 === 0;
     
     for (let rank = 0; rank < results.length; rank++) {
@@ -215,11 +215,11 @@ function unifiedRRF(
   const sortedResults = Array.from(scoreMap.values())
     .sort((a, b) => b.rrfScore - a.rrfScore);
 
-  return sortedResults.map(({ result, rrfScore, bestRelevanceScore, ftsRank, vectorRank }) => ({
+  return sortedResults.map(({ result, rrfScore, ftsRank, vectorRank }) => ({
     ...result.result,
     source: result.source,
     chunkType: result.chunkType,
-    score: bestRelevanceScore,
+    score: rrfScore,
     rrfScore,
     ftsRank,
     vectorRank,

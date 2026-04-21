@@ -89,6 +89,9 @@ const LANGUAGE_MAP: Record<string, string> = {
   'go': 'go',
   'rs': 'rust',
   'java': 'java',
+  'php': 'php',
+  'phtml': 'php',
+  'rb': 'ruby',
 };
 
 export function getLanguageFromExtension(ext: string): string | null {

@@ -38,6 +38,7 @@ import {
 import type { HybridSearchOptions } from './search/index.js';
 import {
   embedGraph,
+  embedGraphBatch,
   embedNodesForFiles,
   generateNodeText,
 } from './embeddings/index.js';
@@ -204,14 +205,14 @@ export class UnifiedQMD {
 
     const { graph, result } = await pipeline.run(repoPath);
 
-    // Generate embeddings if LLM is available
+    // Generate embeddings if LLM is available — use batch for efficiency
     let embeddingsGenerated = 0;
     if (options?.generateEmbeddings !== false && this.llm) {
-      const embeddings = await embedGraph(graph, async (text) => {
-        const result = await this.llm!.embed(text);
-        return result?.embedding ?? [];
+      const embeddings = await embedGraphBatch(graph, async (texts) => {
+        const results = await this.llm!.embedBatch(texts);
+        return results.map(r => r?.embedding ?? []);
       }, {
-        batchSize: 10,
+        batchSize: 32,
         onProgress: (processed, total) => {
           options?.onProgress?.('embeddings', processed / total, `Embedded ${processed}/${total} symbols`);
         },
@@ -241,6 +242,24 @@ export class UnifiedQMD {
       includeDocuments?: boolean;
     }
   ): Promise<UnifiedSearchResult[]> {
+    const { results } = await this.searchWithTelemetry(query, options);
+    return results;
+  }
+
+  /**
+   * Search and return both results and telemetry.
+   * This keeps backward compatibility for existing `search()` callers while
+   * allowing downstream runtimes to consume rerank/query-detection telemetry.
+   */
+  async searchWithTelemetry(
+    query: string,
+    options?: HybridSearchOptions & {
+      includeDocuments?: boolean;
+    }
+  ): Promise<{
+    results: UnifiedSearchResult[];
+    telemetry: Awaited<ReturnType<typeof hybridSearch>>['telemetry'];
+  }> {
     await this.ensureInitialized();
 
     // Get query embedding if LLM is available
@@ -255,15 +274,17 @@ export class UnifiedQMD {
     }
 
     // Perform hybrid search
-    const results = await hybridSearch(
+    const searchResult = await hybridSearch(
       query,
       this.graphBackend!,
       queryEmbedding,
       options
     );
 
-    // Convert to unified format
-    return results.map(r => this.searchResultToUnified(r));
+    return {
+      results: searchResult.results.map(r => this.searchResultToUnified(r)),
+      telemetry: searchResult.telemetry,
+    };
   }
 
   /**

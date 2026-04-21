@@ -65,6 +65,16 @@ describe('Parser Factory', () => {
       expect(parser?.language).toBe('java');
     });
 
+    it('should return PHP parser for .php', () => {
+      const parser = getParserByExtension('index.php');
+      expect(parser?.language).toBe('php');
+    });
+
+    it('should return Ruby parser for .rb', () => {
+      const parser = getParserByExtension('worker.rb');
+      expect(parser?.language).toBe('ruby');
+    });
+
     it('should return null for unknown extensions', () => {
       expect(getParserByExtension('test.txt')).toBeNull();
       expect(getParserByExtension('test.json')).toBeNull();
@@ -84,6 +94,8 @@ describe('Parser Factory', () => {
       expect(getLanguageFromExtension('.go')).toBe('go');
       expect(getLanguageFromExtension('.rs')).toBe('rust');
       expect(getLanguageFromExtension('.java')).toBe('java');
+      expect(getLanguageFromExtension('.php')).toBe('php');
+      expect(getLanguageFromExtension('.rb')).toBe('ruby');
     });
 
     it('should return null for unknown extensions', () => {
@@ -100,6 +112,8 @@ describe('Parser Factory', () => {
       expect(isCodeFile('test.go')).toBe(true);
       expect(isCodeFile('test.rs')).toBe(true);
       expect(isCodeFile('test.java')).toBe(true);
+      expect(isCodeFile('index.php')).toBe(true);
+      expect(isCodeFile('worker.rb')).toBe(true);
     });
 
     it('should return false for non-code files', () => {
@@ -177,6 +191,27 @@ describe('Parser Factory', () => {
       
       expect(result).toBeDefined();
       expect(result!.language).toBe('java');
+    });
+
+    it('should parse PHP files', async () => {
+      const code = `<?php
+function hello($name) {
+  return strtoupper($name);
+}`;
+      const result = await parseFile(code, 'hello.php');
+      expect(result).toBeDefined();
+      expect(result!.language).toBe('php');
+      expect(result!.symbols.length).toBeGreaterThan(0);
+    });
+
+    it('should parse Ruby files', async () => {
+      const code = `def hello(name)
+  name.upcase
+end`;
+      const result = await parseFile(code, 'hello.rb');
+      expect(result).toBeDefined();
+      expect(result!.language).toBe('ruby');
+      expect(result!.symbols.length).toBeGreaterThan(0);
     });
 
     it('should return null for unknown file types', async () => {

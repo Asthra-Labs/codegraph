@@ -353,6 +353,7 @@ export type LlamaCppConfig = {
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 
 export class LlamaCpp implements LLM {
+  private static readonly GPU_BACKEND_PRIORITY = ["cuda", "metal", "vulkan"] as const;
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
   private embedContexts: LlamaEmbeddingContext[] = [];
@@ -491,24 +492,29 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Detect available GPU types and use the best one.
-      // We can't rely on gpu:"auto" — it returns false even when CUDA is available
-      // (likely a binary/build config issue in node-llama-cpp).
-      const gpuTypes = await getLlamaGpuTypes();
-      // Prefer CUDA > Metal > Vulkan > CPU
-      const preferred = (["cuda", "metal", "vulkan"] as const).find(g => gpuTypes.includes(g));
+      const forceCpu = process.env.QMD_FORCE_CPU === "1" || process.env.QMD_FORCE_CPU === "true";
+      let llama: Llama | null = null;
 
-      let llama: Llama;
-      if (preferred) {
-        try {
-          llama = await getLlama({ gpu: preferred, logLevel: LlamaLogLevel.error });
-        } catch {
-          llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
+      if (!forceCpu) {
+        const candidates = await this.getGpuCandidates();
+        const failures: string[] = [];
+
+        for (const backend of candidates) {
+          const probe = await this.tryInitializeGpuBackend(backend, failures);
+          if (probe) {
+            llama = probe;
+            break;
+          }
+        }
+
+        if (!llama && failures.length > 0) {
           process.stderr.write(
-            `QMD Warning: ${preferred} reported available but failed to initialize. Falling back to CPU.\n`
+            `QMD Warning: all GPU initialization attempts failed (${failures.join(" | ")}). Falling back to CPU.\n`
           );
         }
-      } else {
+      }
+
+      if (!llama) {
         llama = await getLlama({ gpu: false, logLevel: LlamaLogLevel.error });
       }
 
@@ -520,6 +526,65 @@ export class LlamaCpp implements LLM {
       this.llama = llama;
     }
     return this.llama;
+  }
+
+  private async getGpuCandidates(): Promise<Array<(typeof LlamaCpp.GPU_BACKEND_PRIORITY)[number]>> {
+    const preferred = [...LlamaCpp.GPU_BACKEND_PRIORITY];
+    try {
+      // Prefer "supported" listing when available (same mode used by bench-rerank).
+      const gpuTypes = await getLlamaGpuTypes("supported");
+      const detected = preferred.filter(backend => gpuTypes.includes(backend));
+      if (detected.length > 0) {
+        return detected;
+      }
+    } catch {
+      // Fall through to optimistic probe.
+    }
+
+    // Detection can be unreliable in some builds. Optimistically probe by priority.
+    return preferred;
+  }
+
+  private async tryInitializeGpuBackend(
+    backend: (typeof LlamaCpp.GPU_BACKEND_PRIORITY)[number],
+    failures: string[]
+  ): Promise<Llama | null> {
+    // CUDA can fail transiently under load; retry once before moving on.
+    const attempts = backend === "cuda" ? 2 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const probe = await getLlama({ gpu: backend, logLevel: LlamaLogLevel.error });
+        if (probe.gpu) {
+          return probe;
+        }
+
+        failures.push(`${backend}: initialized without GPU`);
+        await this.safeDisposeLlama(probe);
+        return null;
+      } catch (error) {
+        failures.push(`${backend} attempt ${attempt}/${attempts}: ${this.formatError(error)}`);
+        if (attempt < attempts) {
+          await new Promise(resolve => setTimeout(resolve, 150));
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private async safeDisposeLlama(llama: Llama): Promise<void> {
+    try {
+      await llama.dispose();
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
+
+  private formatError(error: unknown): string {
+    if (error instanceof Error && error.message.trim().length > 0) {
+      return error.message.replace(/\s+/g, " ");
+    }
+    return String(error);
   }
 
   /**
